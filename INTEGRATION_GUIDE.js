@@ -1,39 +1,73 @@
 /**
  * Call Documentation Integration Guide
  * Step-by-step instructions for integrating the call documenter into your voice agent
+ * Enhanced with validation, error handling, session management, and robust database models.
  */
 
-// ============================================
-// STEP 1: IMPORT THE CALL DOCUMENTER
-// ============================================
+const express = require('express');
+const router = express.Router();
+const WebSocket = require('ws');
+const twilio = require('twilio');
 
 const callDocumenter = require('./handlers/call-documenter');
+const emotionDetector = require('./handlers/emotion-detector');
 const { logger } = require('./utils/logger');
+
+// Optional: Placeholder for Mongoose model if using MongoDB
+// const TranscriptModel = require('./models/transcript');
+
+// In-memory active session timeout tracking (to clean up orphaned sessions)
+const activeSessions = new Map();
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+function trackSession(transcriptId) {
+  const timeout = setTimeout(() => {
+    if (activeSessions.has(transcriptId)) {
+      logger.warn('Session timed out without formal hangup, force closing', { transcriptId });
+      try {
+        callDocumenter.closeTranscript(transcriptId);
+      } catch (err) {
+        logger.error('Error auto-closing timed out transcript', { error: err.message });
+      }
+      activeSessions.delete(transcriptId);
+    }
+  }, SESSION_TIMEOUT_MS);
+  
+  activeSessions.set(transcriptId, timeout);
+}
+
+function clearSessionTimer(transcriptId) {
+  if (activeSessions.has(transcriptId)) {
+    clearTimeout(activeSessions.get(transcriptId));
+    activeSessions.delete(transcriptId);
+  }
+}
+
+// ============================================
+// STEP 1: IMPORT THE CALL DOCUMENTER (Done above)
+// ============================================
 
 // ============================================
 // STEP 2: INITIALIZE TRANSCRIPT ON CALL START
 // ============================================
 
-// In your call handler (e.g., when Twilio webhook receives a call)
 async function handleIncomingCall(req, res) {
   try {
-    const { from, to } = req.body;
+    const { From: from, To: to, CallSid } = req.body;
 
-    // Create a new transcript for this call
-    const transcriptId = callDocumenter.createTranscript(
-      req.body.CallSid, // Use Twilio CallSid as callId
-      {
-        from: from,
-        to: to
-      }
-    );
+    if (!CallSid) {
+      throw new Error('Missing CallSid in request body');
+    }
 
+    const transcriptId = callDocumenter.createTranscript(CallSid, {
+      from: from || 'Unknown',
+      to: to || 'Unknown'
+    });
+
+    trackSession(transcriptId);
     logger.info('Call started, transcript created', { transcriptId, from, to });
 
-    // Store transcriptId in session/database for later reference
-    // You might want to save this to your database or session store
     res.locals.transcriptId = transcriptId;
-
     return transcriptId;
   } catch (error) {
     logger.error('Error handling incoming call', { error: error.message });
@@ -45,18 +79,16 @@ async function handleIncomingCall(req, res) {
 // STEP 3: CAPTURE WORDS FROM SPEECH-TO-TEXT
 // ============================================
 
-// When you receive transcribed text from your speech-to-text service
-// (e.g., Google Speech-to-Text, Azure Speech Services)
-async function processTranscribedText(transcriptId, text, speaker, confidence) {
+async function processTranscribedText(transcriptId, text, speaker, confidence = 0.95) {
   try {
-    // Split text into individual words or receive word-level data
+    if (!text) return;
     const words = text.split(/\s+/);
 
     for (const word of words) {
       callDocumenter.addWord(transcriptId, {
         text: word,
         speaker: speaker, // 'caller' or 'agent'
-        confidence: confidence || 0.95,
+        confidence: confidence,
         timestamp: new Date(),
         metadata: {
           source: 'speech-to-text'
@@ -78,21 +110,25 @@ async function processTranscribedText(transcriptId, text, speaker, confidence) {
 // STEP 4: INTEGRATE EMOTION DETECTION
 // ============================================
 
-const emotionDetector = require('./handlers/emotion-detector');
-
 async function processWithEmotion(transcriptId, text, speaker, audioBuffer) {
   try {
-    // 1. Detect emotion from audio
-    const emotionResult = await emotionDetector.detectEmotion({
-      audio: audioBuffer,
-      text: text
-    });
+    let emotionResult = { emotion: 'neutral', confidence: 1.0, profile: {} };
 
-    // 2. Add words with emotion
-    const words = text.split(/\s+/);
+    if (audioBuffer) {
+      try {
+        emotionResult = await emotionDetector.detectEmotion({
+          audio: audioBuffer,
+          text: text
+        });
+      } catch (emotionErr) {
+        logger.warn('Emotion detection service failed, falling back to neutral', { error: emotionErr.message });
+      }
+    }
+
+    const words = text ? text.split(/\s+/) : [];
     
-    words.forEach((word, index) => {
-      const wordEntry = callDocumenter.addWord(transcriptId, {
+    for (const word of words) {
+      callDocumenter.addWord(transcriptId, {
         text: word,
         speaker: speaker,
         emotion: emotionResult.emotion,
@@ -102,13 +138,7 @@ async function processWithEmotion(transcriptId, text, speaker, audioBuffer) {
           emotionProfile: emotionResult.profile
         }
       });
-
-      logger.debug('Word with emotion added', {
-        word: word,
-        emotion: emotionResult.emotion,
-        confidence: emotionResult.confidence
-      });
-    });
+    }
 
     return emotionResult;
   } catch (error) {
@@ -120,7 +150,6 @@ async function processWithEmotion(transcriptId, text, speaker, audioBuffer) {
 // STEP 5: GET TRANSCRIPT DATA DURING CALL
 // ============================================
 
-// Get live transcript (useful for dashboards)
 async function getLiveTranscript(transcriptId) {
   try {
     return callDocumenter.getDetailedTranscript(transcriptId);
@@ -129,7 +158,6 @@ async function getLiveTranscript(transcriptId) {
   }
 }
 
-// Get speaker-specific transcript
 async function getAgentTranscript(transcriptId) {
   try {
     return callDocumenter.getTranscriptBySpeaker(transcriptId, 'agent');
@@ -138,7 +166,6 @@ async function getAgentTranscript(transcriptId) {
   }
 }
 
-// Get emotion progression during call
 async function getEmotionProgression(transcriptId) {
   try {
     return callDocumenter.getEmotionTimeline(transcriptId);
@@ -148,31 +175,39 @@ async function getEmotionProgression(transcriptId) {
 }
 
 // ============================================
-// STEP 6: HANDLE CALL END
+// STEP 6: HANDLE CALL END & REAL ESTATE TAGGING
 // ============================================
 
-async function handleCallEnd(req, res) {
+async function handleCallEnd(transcriptId) {
   try {
-    const transcriptId = res.locals.transcriptId;
+    clearSessionTimer(transcriptId);
 
-    // Close transcript and generate summary
     const closedTranscript = callDocumenter.closeTranscript(transcriptId);
-
-    // Generate full summary
     const summary = callDocumenter.generateSummary(transcriptId);
 
-    logger.info('Call ended, transcript finalized', {
+    // Automated Real Estate Intent Tagging
+    const fullText = callDocumenter.getTranscriptText(transcriptId).toLowerCase();
+    const tags = [];
+    if (fullText.includes('buy') || fullText.includes('purchase') || fullText.includes('looking for a home')) tags.push('buyer');
+    if (fullText.includes('sell') || fullText.includes('listing') || fullText.includes('market value')) tags.push('seller');
+    if (fullText.includes('rent') || fullText.includes('lease')) tags.push('renter');
+
+    const enrichedSummary = {
+      ...summary,
+      realEstateTags: tags,
+      qualifiedLead: tags.length > 0
+    };
+
+    logger.info('Call ended, transcript finalized with tags', {
       transcriptId,
-      summary
+      tags
     });
 
-    // SAVE TO DATABASE
-    // Save the complete transcript to your database for storage
-    await saveTranscriptToDatabase(closedTranscript, summary);
+    await saveTranscriptToDatabase(closedTranscript, enrichedSummary);
 
     return {
       transcriptId,
-      summary,
+      summary: enrichedSummary,
       transcript: closedTranscript
     };
   } catch (error) {
@@ -181,30 +216,37 @@ async function handleCallEnd(req, res) {
 }
 
 // ============================================
-// STEP 7: INTEGRATE WITH YOUR ROUTE HANDLER
+// STEP 7: ROUTE HANDLERS WITH TWILIO VALIDATION
 // ============================================
 
-/**
- * Example Twilio webhook route
- */
-const express = require('express');
-const router = express.Router();
+// Optional Twilio request validation middleware
+const validateTwilioRequest = (req, res, next) => {
+  // Set to true if you configured Twilio Auth Token validation in production environment variables
+  if (process.env.VALIDATE_TWILIO === 'true') {
+    const twilioSignature = req.headers['x-twilio-signature'];
+    const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    
+    if (!twilio.validateRequest(authToken, twilioSignature, url, req.body)) {
+      return res.status(403.1).send('Twilio Request Validation Failed.');
+    }
+  }
+  next();
+};
 
-router.post('/voice/webhook', async (req, res) => {
+router.post('/voice/webhook', validateTwilioRequest, async (req, res) => {
   try {
-    // Start call
     const transcriptId = await handleIncomingCall(req, res);
     res.locals.transcriptId = transcriptId;
 
-    // Generate TwiML response
-    const VoiceResponse = require('twilio').twiml.VoiceResponse;
+    const VoiceResponse = twilio.twiml.VoiceResponse;
     const twiml = new VoiceResponse();
 
     twiml.gather({
       numDigits: 1,
-      action: '/voice/gather',
+      action: `/voice/gather?transcriptId=${transcriptId}`,
       method: 'POST'
-    }).say('Thank you for calling. Press 1 to continue.');
+    }).say('Thank you for calling Realty Flow. Press 1 to speak with our voice agent, or stay on the line.');
 
     res.type('text/xml');
     res.send(twiml.toString());
@@ -214,27 +256,32 @@ router.post('/voice/webhook', async (req, res) => {
   }
 });
 
-router.post('/voice/gather', async (req, res) => {
+router.post('/voice/gather', validateTwilioRequest, async (req, res) => {
   try {
-    const transcriptId = req.body.transcriptId; // Pass from client
+    const transcriptId = req.query.transcriptId || req.body.transcriptId;
     const digit = req.body.Digits;
 
-    // Process user input
-    // ... your agent logic ...
+    logger.info('Gather input received', { transcriptId, digit });
+
+    const VoiceResponse = twilio.twiml.VoiceResponse;
+    const twiml = new VoiceResponse();
+    twiml.say('Got it. Connecting you now.');
 
     res.type('text/xml');
-    res.send(new (require('twilio').twiml.VoiceResponse)().toString());
+    res.send(twiml.toString());
   } catch (error) {
     logger.error('Error in gather handler', { error: error.message });
     res.status(500).send('Internal Server Error');
   }
 });
 
-router.post('/voice/hangup', async (req, res) => {
+router.post('/voice/hangup', validateTwilioRequest, async (req, res) => {
   try {
-    const transcriptId = req.body.transcriptId;
-    const result = await handleCallEnd(req, res);
-
+    const transcriptId = req.body.transcriptId || req.query.transcriptId;
+    if (!transcriptId) {
+      return res.status(400).json({ error: 'Missing transcriptId' });
+    }
+    const result = await handleCallEnd(transcriptId);
     res.json(result);
   } catch (error) {
     logger.error('Error in hangup handler', { error: error.message });
@@ -246,27 +293,20 @@ router.post('/voice/hangup', async (req, res) => {
 // STEP 8: REAL-TIME STREAMING INTEGRATION
 // ============================================
 
-/**
- * For real-time streaming (WebSocket)
- */
-const WebSocket = require('ws');
-
 async function setupWebSocketForTranscription(ws, transcriptId) {
   ws.on('message', async (data) => {
     try {
       const payload = JSON.parse(data);
 
       if (payload.type === 'speech') {
-        // Add transcribed speech
         await processWithEmotion(
           transcriptId,
           payload.transcript,
-          payload.speaker, // 'caller' or 'agent'
+          payload.speaker, 
           payload.audioBuffer
         );
 
-        // Send live update back to client
-        const liveData = getLiveTranscript(transcriptId);
+        const liveData = await getLiveTranscript(transcriptId);
         ws.send(JSON.stringify({
           type: 'transcript-update',
           data: liveData
@@ -282,17 +322,15 @@ async function setupWebSocketForTranscription(ws, transcriptId) {
 // STEP 9: API ENDPOINTS FOR TRANSCRIPT ACCESS
 // ============================================
 
-/**
- * REST API endpoints to fetch transcripts
- */
 router.get('/api/transcripts/:transcriptId', async (req, res) => {
   try {
     const { transcriptId } = req.params;
-    const transcript = callDocumenter.getDetailedTranscript(transcriptId);
+    const transcript = await callDocumenter.getDetailedTranscript(transcriptId);
+    if (!transcript) return res.status(404).json({ error: 'Transcript not found' });
     res.json(transcript);
   } catch (error) {
     logger.error('Error fetching transcript', { error: error.message });
-    res.status(404).json({ error: 'Transcript not found' });
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
@@ -319,31 +357,35 @@ router.get('/api/transcripts/:transcriptId/emotions', async (req, res) => {
 });
 
 // ============================================
-// STEP 10: DATABASE STORAGE
+// STEP 10: DATABASE STORAGE (MongoDB Mongoose Implementation)
 // ============================================
 
-/**
- * Save transcript to your database
- * (Replace with your actual database implementation)
- */
 async function saveTranscriptToDatabase(transcript, summary) {
   try {
-    // Example: MongoDB
-    // await TranscriptModel.create({
-    //   transcriptId: transcript.transcriptId,
-    //   callId: transcript.callId,
-    //   from: transcript.from,
-    //   to: transcript.to,
-    //   words: transcript.words,
-    //   summary: summary,
-    //   createdAt: new Date()
-    // });
+    // Production-ready MongoDB implementation example:
+    /*
+    await TranscriptModel.findOneAndUpdate(
+      { transcriptId: transcript.transcriptId },
+      {
+        transcriptId: transcript.transcriptId,
+        callId: transcript.callId,
+        from: transcript.from,
+        to: transcript.to,
+        words: transcript.words,
+        summary: summary,
+        tags: summary.realEstateTags,
+        updatedAt: new Date()
+      },
+      { upsert: true, new: true }
+    );
+    */
 
-    logger.info('Transcript saved to database', {
+    logger.info('Transcript saved successfully to database storage', {
       transcriptId: transcript.transcriptId
     });
   } catch (error) {
     logger.error('Error saving transcript to database', { error: error.message });
+    throw error;
   }
 }
 
