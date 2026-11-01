@@ -1,14 +1,15 @@
 const express = require('express');
+const twilio = require('twilio');
 const router = express.Router();
 const voiceHandler = require('../handlers/voice-handler');
 const { logger } = require('../utils/logger');
 
 /**
- * Handle incoming voice calls
+ * Handle incoming voice calls.
  */
 router.post('/incoming', async (req, res) => {
   try {
-    logger.info('Incoming call received', { from: req.body.From });
+    logger.info('Incoming call received', { from: req.body.From || req.body.from });
     const twimlResponse = await voiceHandler.handleIncomingCall(req.body);
     res.type('text/xml');
     res.send(twimlResponse);
@@ -19,13 +20,47 @@ router.post('/incoming', async (req, res) => {
 });
 
 /**
- * Handle call recording webhook
+ * Twilio-compatible webhook alias.
+ */
+router.post('/webhook', async (req, res) => {
+  try {
+    logger.info('Incoming Twilio webhook received', { from: req.body.From || req.body.from });
+    const twimlResponse = await voiceHandler.handleIncomingCall(req.body);
+    res.type('text/xml');
+    res.send(twimlResponse);
+  } catch (error) {
+    logger.error('Error handling webhook', { error: error.message });
+    res.status(500).json({ error: 'Failed to process callback' });
+  }
+});
+
+/**
+ * Handle speech response after Twilio gather.
+ */
+router.post('/response', async (req, res) => {
+  try {
+    logger.info('Voice response received', { body: req.body });
+    const twimlResponse = await voiceHandler.handleSpeechResponse(req.body);
+    res.type('text/xml');
+    res.send(twimlResponse);
+  } catch (error) {
+    logger.error('Error processing voice response', { error: error.message });
+    const fallback = new twilio.twiml.VoiceResponse();
+    fallback.say('Thanks for calling Realty Flow. Let me connect you to the right service.');
+    fallback.hangup();
+    res.type('text/xml');
+    res.send(fallback.toString());
+  }
+});
+
+/**
+ * Handle call recording webhook.
  */
 router.post('/recording', async (req, res) => {
   try {
     logger.info('Call recording received', { callSid: req.body.CallSid });
-    await voiceHandler.processRecording(req.body);
-    res.json({ status: 'success' });
+    const result = await voiceHandler.processRecording(req.body);
+    res.json(result);
   } catch (error) {
     logger.error('Error processing recording', { error: error.message });
     res.status(500).json({ error: 'Failed to process recording' });
@@ -33,7 +68,7 @@ router.post('/recording', async (req, res) => {
 });
 
 /**
- * Get call history
+ * Get call history.
  */
 router.get('/history', async (req, res) => {
   try {
@@ -47,10 +82,11 @@ router.get('/history', async (req, res) => {
 });
 
 /**
- * Get specific call details
+ * Get specific call details.
  */
 router.get('/:callId', async (req, res) => {
-  try {\n    const callDetails = await voiceHandler.getCallDetails(req.params.callId);
+  try {
+    const callDetails = await voiceHandler.getCallDetails(req.params.callId);
     res.json(callDetails);
   } catch (error) {
     logger.error('Error retrieving call details', { error: error.message });

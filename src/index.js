@@ -7,23 +7,26 @@ const emotionRoutes = require('./routes/emotion-routes');
 const { logger } = require('./utils/logger');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-// Middleware
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || true,
+  credentials: true
+}));
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-// Routes
 app.use('/api/voice', voiceRoutes);
 app.use('/api/emotion', emotionRoutes);
 
-// Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: 'realty-flow-voice-agent'
+  });
 });
 
-// Error handling middleware
 app.use((err, req, res, next) => {
   logger.error('Error:', err);
   res.status(err.status || 500).json({
@@ -32,14 +35,18 @@ app.use((err, req, res, next) => {
   });
 });
 
-// 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  logger.info(`Voice Agent server running on port ${PORT}`);
-});
+const startServer = () => {
+  app.listen(PORT, () => {
+    logger.info(`Voice Agent server running on port ${PORT}`);
+  });
+};
 
-module.exports = app;
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { app, startServer };

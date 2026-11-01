@@ -2,45 +2,50 @@ const axios = require('axios');
 const { logger } = require('../utils/logger');
 const { getEmotionProfile } = require('../utils/emotion-mapper');
 
-// In-memory emotion storage (replace with database in production)
+const DEFAULT_EMOTION = 'neutral';
 const emotionHistory = [];
+
+const normalizeEmotion = (value = DEFAULT_EMOTION) => {
+  const normalized = String(value || DEFAULT_EMOTION).trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call({ happy: true, frustrated: true, anxious: true, satisfied: true, angry: true, neutral: true }, normalized)
+    ? normalized
+    : DEFAULT_EMOTION;
+};
 
 const emotionDetector = {
   /**
-   * Detect emotion from audio or text
+   * Detect emotion from audio or text.
    */
-  detectEmotion: async (input) => {
+  detectEmotion: async (input = {}) => {
     try {
       const { audio, text, audioUrl } = input;
-      let detectedEmotion = 'neutral';
-      let confidence = 0;
+      let detectedEmotion = DEFAULT_EMOTION;
+      let confidence = 0.5;
 
       if (audio || audioUrl) {
-        // Call external emotion detection API for audio
         const audioResult = await emotionDetector.detectFromAudio(audio || audioUrl);
         detectedEmotion = audioResult.emotion;
         confidence = audioResult.confidence;
       } else if (text) {
-        // Detect emotion from text
         const textResult = await emotionDetector.detectFromText(text);
         detectedEmotion = textResult.emotion;
         confidence = textResult.confidence;
       }
 
+      const normalizedEmotion = normalizeEmotion(detectedEmotion);
       const emotionData = {
-        emotion: detectedEmotion,
-        confidence,
-        profile: getEmotionProfile(detectedEmotion),
+        emotion: normalizedEmotion,
+        confidence: Number(confidence) || 0.5,
+        profile: getEmotionProfile(normalizedEmotion),
         timestamp: new Date(),
         input: text ? 'text' : 'audio'
       };
 
-      // Store in history
       emotionHistory.push(emotionData);
 
       logger.info('Emotion detected', {
-        emotion: detectedEmotion,
-        confidence
+        emotion: normalizedEmotion,
+        confidence: emotionData.confidence
       });
 
       return emotionData;
@@ -51,51 +56,63 @@ const emotionDetector = {
   },
 
   /**
-   * Detect emotion from audio
+   * Detect emotion from audio.
    */
   detectFromAudio: async (audioInput) => {
     try {
-      // Integration with external emotion detection service (e.g., Azure, Google, AWS)
-      // This is a placeholder implementation
+      if (!process.env.EMOTION_API_ENDPOINT) {
+        return {
+          emotion: DEFAULT_EMOTION,
+          confidence: 0.5
+        };
+      }
+
       const response = await axios.post(
         process.env.EMOTION_API_ENDPOINT,
         { audio: audioInput },
         {
           headers: {
-            'Authorization': `Bearer ${process.env.EMOTION_API_KEY}`
-          }
+            Authorization: `Bearer ${process.env.EMOTION_API_KEY || ''}`
+          },
+          timeout: 10000
         }
       );
 
       return {
-        emotion: response.data.emotion || 'neutral',
-        confidence: response.data.confidence || 0.5
+        emotion: normalizeEmotion(response.data?.emotion || DEFAULT_EMOTION),
+        confidence: Number(response.data?.confidence) || 0.5
       };
     } catch (error) {
       logger.warn('Error calling emotion API, using default', { error: error.message });
       return {
-        emotion: 'neutral',
-        confidence: 0
+        emotion: DEFAULT_EMOTION,
+        confidence: 0.5
       };
     }
   },
 
   /**
-   * Detect emotion from text
+   * Detect emotion from text using a keyword match strategy.
    */
   detectFromText: async (text) => {
     try {
-      // Simple keyword-based emotion detection (placeholder)
+      if (!text || !String(text).trim()) {
+        return {
+          emotion: DEFAULT_EMOTION,
+          confidence: 0.5
+        };
+      }
+
       const emotionKeywords = {
-        happy: ['happy', 'great', 'wonderful', 'excellent', 'love', 'amazing'],
-        frustrated: ['frustrated', 'annoyed', 'irritated', 'upset', 'angry'],
-        anxious: ['worried', 'anxious', 'nervous', 'scared', 'concerned'],
-        satisfied: ['satisfied', 'pleased', 'good', 'fine', 'okay'],
-        angry: ['angry', 'furious', 'hate', 'disgusted', 'mad']
+        happy: ['happy', 'great', 'wonderful', 'excellent', 'love', 'amazing', 'good', 'pleased', 'excited'],
+        frustrated: ['frustrated', 'annoyed', 'irritated', 'upset', 'angry', 'fed up', 'tired', 'disappointed'],
+        anxious: ['worried', 'anxious', 'nervous', 'scared', 'concerned', 'afraid', 'stressed'],
+        satisfied: ['satisfied', 'pleased', 'good', 'fine', 'okay', 'comfortable', 'confident', 'content'],
+        angry: ['angry', 'furious', 'hate', 'disgusted', 'mad', 'rage']
       };
 
-      const lowerText = text.toLowerCase();
-      let detectedEmotion = 'neutral';
+      const lowerText = String(text).toLowerCase();
+      let detectedEmotion = DEFAULT_EMOTION;
       let maxMatches = 0;
 
       for (const [emotion, keywords] of Object.entries(emotionKeywords)) {
@@ -106,10 +123,16 @@ const emotionDetector = {
         }
       }
 
+      if (maxMatches === 0) {
+        const neutralSignals = ['hello', 'hi', 'thanks', 'thank you', 'okay', 'fine', 'morning', 'evening'];
+        const neutralMatches = neutralSignals.filter(signal => lowerText.includes(signal)).length;
+        detectedEmotion = neutralMatches > 0 ? DEFAULT_EMOTION : DEFAULT_EMOTION;
+      }
+
       const confidence = maxMatches > 0 ? Math.min(maxMatches * 0.2, 0.95) : 0.5;
 
       return {
-        emotion: detectedEmotion,
+        emotion: normalizeEmotion(detectedEmotion),
         confidence
       };
     } catch (error) {
@@ -119,7 +142,7 @@ const emotionDetector = {
   },
 
   /**
-   * Get emotion statistics
+   * Get emotion statistics.
    */
   getEmotionStats: async (timeRange = '24h') => {
     try {
@@ -132,9 +155,11 @@ const emotionDetector = {
         startTime = new Date(now - 7 * 24 * 60 * 60 * 1000);
       } else if (timeRange === '30d') {
         startTime = new Date(now - 30 * 24 * 60 * 60 * 1000);
+      } else {
+        startTime = new Date(now - 24 * 60 * 60 * 1000);
       }
 
-      const filtered = emotionHistory.filter(e => e.timestamp >= startTime);
+      const filtered = emotionHistory.filter(entry => entry.timestamp >= startTime);
       const emotionCounts = {};
 
       filtered.forEach(entry => {
