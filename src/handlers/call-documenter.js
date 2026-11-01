@@ -140,7 +140,7 @@ const callDocumenter = {
         text += word.text;
       });
 
-      return text;
+      return text.trim();
     } catch (error) {
       logger.error('Error getting transcript text', { error: error.message });
       throw error;
